@@ -50,8 +50,8 @@ load_modules() {
 	sleep 1
 
 	if [ "$driver" != "88XXau" ]; then
-		opt1="rtw_tx_pwr_by_rate=0"
-		opt2="rtw_tx_pwr_lmt_enable=0"
+		opt1="rtw_tx_pwr_by_rate=2"
+		opt2="rtw_tx_pwr_lmt_enable=2"
 	fi
 
 	modprobe "$driver" "$opt1" "$opt2"
@@ -106,43 +106,85 @@ start_telemetry() {
 	chipset=$(ipcinfo -c)
 	[ "$chipset" = "ssc33x" ] && devmem 0x1F207890 16 0x8
 
-	port_rx=14550
-	port_tx=14551
-
 	echo_log "Starting $router"
-	load_wfb 144 16 "$port_rx" "$port_tx"
+	load_wfb 144 16 "$port_rx" "$port_tx" 8002
 
-	if [ "$router" = "mavfwd" ]; then
-		mavfwd -b 115200 -c 8 -p 100 -a 15 -t -m /dev/"$serial" \
-			-o 127.0.0.1:"$port_tx" -i 127.0.0.1:"$port_rx" > /dev/null &
+        telemetry_apps "$port_rx" "$port_tx"
+}
+
+start_alink() {
+	if [ "$link_control" = "alink" ]; then
+		echo_log "Starting alink_drone"
+		alink_drone &> /dev/null &
 	else
-		if [ "$router" = "msposd" ]; then
-			size=$(curl -s localhost/api/v1/config.json | jsonfilter -qe "@.video0.size")
-		fi
-		msposd -b 115200 -c 8 -r "$osd_fps" -m /dev/"$serial" \
-			-o 127.0.0.1:"$port_tx" -z "$size" > /dev/null &
+		echo_log "alink disabled, skipping"
 	fi
+}
+
+telemetry_apps() {
+    echo_log "Starting telemetry apps"
+
+    # Override IP if using tunnel
+    ip_out="127.0.0.1"
+    if [ "$downlink" = "tunnel" ]; then
+        ip_out="10.5.0.1"
+    fi
+
+    if [ "$router" = "mavfwd" ]; then
+        mavfwd -b 115200 -c 8 -p 100 -a 15 -t -m /dev/"$serial" \
+            -o "$ip_out":"$2" -i "$ip_out":"$1" >/dev/null &
+    else
+        if [ "$router" = "msposd" ]; then
+            size=$(curl -s localhost/api/v1/config.json | jsonfilter -qe "@.video0.size")
+        fi
+        msposd -b 115200 -c 8 -r "$osd_fps" -m /dev/"$serial" \
+            -o "$ip_out":"$2" -z "$size" &>/dev/null &
+    fi
 }
 
 video_settings() {
 	sensor=$(ipcinfo -s)
 	cli -s .isp.sensorConfig /etc/sensors/"$sensor"_fpv.bin
-	cli -s .isp.exposure 5
+	cli -s .isp.exposure 10
 	cli -s .video0.fps 60
-	cli -s .video0.bitrate 8192
+	cli -s .video0.bitrate 8000
 	cli -s .video0.codec h265
 	cli -s .video0.rcMode cbr
 	cli -s .outgoing.enabled true
 	cli -s .outgoing.wfb true
-	cli -s .fpv.enabled true
-	cli -s .fpv.noiseLevel 1
 	cli -s .records.split 1
 	cli -s .records.notime true
+	cli -s .fpv.enabled true
+	cli -s .fpv.noiseLevel 0
+	if [ "$sensor" = "imx335" ]; then
+		cli -s .video0.size 1920x1440
+	else
+		cli -s .video0.size 1920x1080
+	fi
+}
+
+wfb_yaml_set() {
+    yaml-cli -i "$wfb_cfg" -s "$@"
+}
+
+set_wfb_yaml_by_driver(){
+    local adapter stbc ldpc
+    case $driver in
+      88XXau) adapter=bl-r8812af1; stbc=1; ldpc=1 ;;
+      8812eu) adapter=bl-m8812eu2; stbc=1; ldpc=1 ;;
+      8733bu) adapter=bl-m8731bu4; stbc=0; ldpc=0 ;;
+      *)      adapter=default;     stbc=0; ldpc=0 ;;
+    esac
+
+    wfb_yaml_set .wireless.wlan_adapter "$adapter"
+    wfb_yaml_set .broadcast.stbc "$stbc"
+    wfb_yaml_set .broadcast.ldpc "$ldpc"
 }
 
 start() {
 	load_config
 	load_modules
+	set_wfb_yaml_by_driver
 	load_mlink
 	load_interface
 
@@ -156,10 +198,11 @@ start() {
 	start_broadcast
 	start_tunnel
 	start_telemetry
+	start_alink
 }
 
 stop() {
-	for process in wfb_rx wfb_tx wfb_tun msposd mavfwd; do
+	for process in wfb_rx wfb_tx wfb_tun msposd mavfwd alink_drone; do
 		if [ -n "$(pidof $process)" ]; then
 			echo_log "Stopping $process"
 			killall -q "$process"
@@ -167,24 +210,61 @@ stop() {
 	done
 }
 
+restart() {
+	target=$1
+	wfb_yaml
+	load_config
+	case "$target" in
+		osd|telemetry|"")
+			echo_log "Restarting telemetry (msposd/mavfwd)"
+			killall -q msposd mavfwd 2>/dev/null
+			sleep 1
+			telemetry_apps "$port_rx" "$port_tx"
+			;;
+		tunnel)
+			echo_log "Restarting tunnel"
+			killall -q wfb_tun 2>/dev/null
+			sleep 1
+			start_tunnel
+			;;
+		broadcast)
+			echo_log "Restarting broadcast"
+			killall -q wfb_tx 2>/dev/null
+			sleep 1
+			start_broadcast
+			;;
+		alink)
+			echo_log "Restarting A-Link (alink_drone)"
+			killall -q alink_drone 2>/dev/null
+			sleep 1
+			start_alink
+			;;
+		*)
+			echo "Usage: $0 restart {osd|tunnel|broadcast|alink}"
+			exit 1
+			;;
+	esac
+}
+
 case "$1" in
 	start|stop)
 		$1
 		;;
-
+	restart)
+		shift
+		restart "$1"
+		;;
 	reset)
 		cp -f /rom"$wfb_cfg" "$wfb_cfg"
 		cp -f /rom/etc/majestic.yaml /etc/majestic.yaml
 		video_settings
 		;;
-
 	cli)
 		shift
 		yaml-cli -i "$wfb_cfg" "$@"
 		;;
-
 	*)
-		echo "Usage: $0 {start|stop|reset|cli}"
+		echo "Usage: $0 {start|stop|restart|reset|cli}"
 		exit 1
 		;;
 esac
