@@ -3,6 +3,8 @@ wireless:
   channel: 161
   width: 20
   mlink: 1500
+	wlan_adapter: default
+  link_control: alink
 broadcast:
   mcs_index: 2
   tun_index: 1
@@ -14,4 +16,4 @@ broadcast:
 telemetry:
   router: msposd
   serial: ttyS2
-  osd_fps: 20
+  osd_fps: 1006
